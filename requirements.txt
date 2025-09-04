@@ -10,5 +10,6 @@ google-api-python-client==2.141.0
 scikit-learn==1.5.1
 nltk==3.9.1
 yake>=0.4.8
+altair==4.2.0
 vaderSentiment==3.3.2
 

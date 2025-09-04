@@ -25,41 +25,42 @@ def get_last_llm_status() -> dict:
 # ---- System prompt (event-first; generic keyword rules) ----
 _PREWRITE_SYSTEM = (
     "You are a warm, concise journaling companion.\n"
-    "Task: generate a short pre-write prompt BEFORE the user types anything today.\n"
-    "Context fields:\n"
-    "  - goal (optional)\n"
-    "  - themes (0–3 strings)\n"
+    "Task: generate a short pre-write prompt before the user types today.\n"
+    "Context:\n"
+    "  - goal (opt)\n"
+    "  - themes (0–3)\n"
     "  - mood_trend (up/flat/down)\n"
-    "  - days_since_last (int or null)\n"
-    "  - today_event / tomorrow_event (optional)\n"
-    "  - keywords (ordered list; may be empty)\n"
+    "  - days_since_last (int|null)\n"
+    "  - today_event / tomorrow_event (opt)\n"
+    "  - keywords (ordered list)\n"
     "\n"
     "EVENT PRIORITY:\n"
-    "  If ANY event is provided, include EXACTLY ONE event question as the FIRST bullet.\n"
-    "  Prefer 'past_today'; else 'later_today'; else 'tomorrow'.\n"
+    "  If any event, first bullet = event Q.\n"
+    "  Priority: past_today > later_today > tomorrow.\n"
     "  Forms:\n"
-    "    past_today  →  How did <summary> go?\n"
-    "    later_today →  What would help you feel ready for <summary> later today?\n"
-    "    tomorrow    →  Are you ready for <summary> tomorrow?\n"
-    "  Use <summary> exactly; do not add times; no quotes.\n"
+    "    past_today → Ex. How did <summary> go?\n"
+    "    later_today → Ex. What would help you feel ready for <summary> later today?\n"
+    "    tomorrow → Ex. Are you ready for <summary> tomorrow?\n"
+    "  Use <summary> exactly; no times; no quotes.\n"
     "\n"
-    "KEYWORDS (single pass):\n"
-    "  Consider keywords IN ORDER; pick the FIRST that supports a concrete, sensible question.\n"
-    "  If a keyword is vague, SKIP it. If it's a single bare word, rephrase into a natural topic\n"
-    "  (e.g., progress with <Word>). Use at most ONE keyword-derived question.\n"
+    "KEYWORDS:\n"
+    "  Check in order; use first sensible one.\n"
+    "  Skip vague words; rephrase single words into natural topics.\n"
+    "  At most one keyword Q.\n"
     "\n"
-    "Do not invent details. Do not reference any current draft text.\n"
-    "Output (STRICT JSON): {\"opener\": str, \"habit\": str|null, \"questions\": [str, ...]}\n"
+    "Do not invent details. Do not reference current drafts.\n"
+    "Output (strict JSON): {\"opener\": str, \"habit\": str|null, \"questions\": [str,...]}\n"
     "Rules:\n"
-    "1) Keep to 3–4 lines total when rendered.\n"
-    "2) Opener: short and neutral, e.g., Set a 3–5 min timer and free-write.\n"
-    "3) Habit line only if days_since_last ≥ 2, e.g., It’s been 3 days since your last entry. What have you been up to?\n"
-    "4) Questions (1–2 bullets, ~18 words max each):\n"
-    "   - If event exists, the FIRST bullet is the event question (per EVENT PRIORITY).\n"
-    "   - Then ONE personal question (keyword/goal/theme/mood as needed).\n"
-    "5) Style guardrails: no quotes, no exclamation marks, no therapy/medical advice, no generic filler.\n"
-    "Return only the JSON object—nothing else."
+    "1) 3–5 lines total when rendered.\n"
+    "2) Opener: short, neutral (e.g., Set a 3–5 min timer and free-write).\n"
+    "3) Habit: only if days_since_last ≥2 (e.g., It’s been 3 days… What have you been up to?).\n"
+    "4) Questions (2–3 bullets, ≤15 words each):\n"
+    "   - Event question first if event exists.\n"
+    "   - Then one personal Q (keyword/goal/theme/mood).\n"
+    "5) Style: no quotes, no exclamation marks, no therapy/medical advice, no filler. Verify that the grammer, puncuation, and capitalization are all proper and make sense.\n"
+    "Return only the JSON."
 )
+
 
 _WEEKLY_SYSTEM = (
     "You are an insightful, concise journaling analyst.\n"
@@ -140,6 +141,32 @@ def _slim_event(ev: Optional[Dict[str, Any]], default_when: str = "") -> Optiona
         "when": (ev.get("when") or default_when).strip(),
     }
 
+def _strip_fences(s: str) -> str:
+    """Remove ```...``` fenced blocks if the model wraps markdown."""
+    if "```" not in (s or ""):
+        return s or ""
+    m = re.search(r"```(?:markdown|md)?\s*([\s\S]*?)```", s, flags=re.I)
+    return (m.group(1).strip() if m else s).strip()
+
+def _dedupe_md(md: str) -> str:
+    """Prefer bullets, drop duplicate lines (para vs bullet), keep order."""
+    lines = (md or "").splitlines()
+    out, seen = [], set()
+    for ln in lines:
+        raw = ln.strip()
+        if not raw:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        key = raw.lstrip("-*• ").strip().rstrip(". ").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(("- " + raw.lstrip("-*• ").strip()) if raw.startswith(("-", "*", "•")) else raw)
+    while out and out[0] == "": out.pop(0)
+    while out and out[-1] == "": out.pop()
+    return "\n".join(out)
+
 def _ollama_generate(prompt: str) -> str:
     r = requests.post(
         f"{_ollama_url()}/api/generate",
@@ -149,7 +176,7 @@ def _ollama_generate(prompt: str) -> str:
             "stream": False,
             "format": "json",
             "options": {
-                "temperature": 0.4,
+                "temperature": 0.35,
                 "top_p": 0.9,
                 "repeat_penalty": 1.1,
                 "num_ctx": 4096,
@@ -273,4 +300,6 @@ def generate_weekly_summary_llm(ctx: Dict[str, Any]) -> str:
     payload = json.dumps(ctx, ensure_ascii=False, indent=2)
     prompt = f"{_WEEKLY_SYSTEM}\n\nWEEK METRICS (JSON):\n{payload}\n"
     text = _ollama_generate_text(prompt).strip()
+    text = _strip_fences(text)
+    text = _dedupe_md(text)
     return text or "No summary available."

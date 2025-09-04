@@ -6,6 +6,8 @@ import base64
 import json
 import requests
 from typing import List
+from collections import Counter
+import hashlib
 
 import altair as alt
 import pandas as pd
@@ -20,7 +22,7 @@ from .services.storage import (
 )
 from .services.google_auth import sign_in_with_google, save_user_token, load_user_token
 from .services.session_store import create_session, get_session, delete_session
-from .services.calendar import get_events_today  # we'll import get_events_tomorrow lazily
+from .services.calendar import get_events_today
 from .services.nlp import analyze_entry, personalized_sentiment
 from .services.analytics import (
     compute_streaks,
@@ -154,7 +156,7 @@ def _save_entry(
 # ---------- Main render ----------
 def render_app():
     _restore_user_from_sid()
-    st.title("📝 Empathetic Journaling Companion")
+    st.title("📝 Ink and Insights")
 
     # ---------- Sidebar ----------
     with st.sidebar:
@@ -268,11 +270,11 @@ def render_app():
     user_sub = st.session_state.user["google_sub"]
 
     # ---------- Tabs ----------
-    tab_write, tab_wrapped, tab_history = st.tabs(["✍️ Write", "🎧 Wrapped", "🗂️ History"])
+    tab_write, tab_wrapped, tab_history = st.tabs(["✍️ Write", "📈 Trends", "🗂️ History"])
 
     # ============ Write ============
     with tab_write:
-        st.subheader("Dynamic, empathetic prompt")
+        st.subheader("Today’s cue:")
 
         # (A) History data
         df_hist = load_entries_df(user_id)
@@ -297,7 +299,6 @@ def render_app():
                 mood_trend = "down"
 
         # Recent themes (aggregate from last ~20 entries)
-        from collections import Counter
         themes: list[str] = []
         if not df_hist.empty:
             bag = []
@@ -383,6 +384,7 @@ def render_app():
 
 
         # (C) Build context for LLM, but DO NOT regenerate on keystrokes
+        # (C) Build the LLM-powered pre-write prompt (cached by context)
         ctx = {
             "goal": (user_goals.strip() if user_goals else None),
             "themes": themes,
@@ -390,42 +392,31 @@ def render_app():
             "days_since_last": days_since_last,
             "today_event": today_event,
             "tomorrow_event": tomorrow_event,
-            "keywords": keyword_candidates,  # lets the model self-validate a useful keyword
         }
 
-        prov = "ollama"
-        modl = _model()
-        pkey = _prompt_key(ctx, prov, modl)
+        # cache key based on context
+        ctx_for_key = {
+            "goal": ctx["goal"],
+            "themes": ctx["themes"],
+            "mood_trend": ctx["mood_trend"],
+            "days_since_last": ctx["days_since_last"],
+            "event": (
+                {"summary": today_event.get("summary",""), "when": today_event.get("when","past_today")}
+                if today_event else
+                ({"summary": tomorrow_event.get("summary",""), "when": "tomorrow"} if tomorrow_event else None)
+            ),
+        }
+        key = "prewrite|" + hashlib.sha1(
+            json.dumps(ctx_for_key, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
 
-        need_new = st.session_state.get("prewrite_key") != pkey or not st.session_state.get("prewrite_text")
-        if need_new:
-            try:
+        prompt_text = st.session_state.get(key)
+        if not prompt_text:
+            with st.spinner("Thinking up a gentle prompt…"):
                 prompt_text = generate_prewrite_prompt_llm(ctx)
-                st.session_state["prewrite_key"] = pkey
-                st.session_state["prewrite_text"] = prompt_text
-            except Exception as e:
-                st.error(f"LLM prompt generation failed: {e}")
-                # keep any previous good prompt in cache; if none, show a minimal notice
-                if not st.session_state.get("prewrite_text"):
-                    st.info("Prompt unavailable. Try 'Refresh prompt' after your LLM is running.")
+            st.session_state[key] = prompt_text
 
-
-        prompt_text = st.session_state.get("prewrite_text", "")
-        if prompt_text:
-            _render_prompt_box(prompt_text)
-
-        c_dbg1, c_dbg2 = st.columns([1, 5])
-        with c_dbg1:
-            if st.button("Refresh prompt", use_container_width=True):
-                st.session_state.pop("prewrite_key", None)
-                st.session_state.pop("prewrite_text", None)
-                st.rerun()
-        with c_dbg2:
-            _st = get_last_llm_status()
-            if _st.get("path") == "llm_ok":
-                st.caption(f"LLM: Ollama · {_st.get('model')}")
-            elif _st.get("path") == "error":
-                st.caption("LLM error; see message above.")
+        st.info(prompt_text)
 
 
         # (D) Editor + controls
@@ -490,57 +481,74 @@ def render_app():
             st.session_state.pop("prewrite_text", None)
             st.rerun()
 
-    # ============ Wrapped ============
+    # ============ Wrapped (Weekly only) ============
     with tab_wrapped:
-        st.subheader("Your ‘Wrapped’ for Emotions")
+        st.subheader("Your Weekly Insights")
 
-        # ---- Period filter ----
-        period = st.segmented_control(
-            "Time range",
-            options=["Daily", "Weekly", "Monthly", "Yearly"],
-            selection_mode="single",
-            key="analytics_period",
-        )
-        days_map = {"Daily": 1, "Weekly": 7, "Monthly": 30, "Yearly": 365}
-        window_days = days_map.get(period, 7)
-
+        # ---- Load data ----
         df_all = load_entries_df(user_id)
         if df_all.empty:
             st.info("No entries yet. Write a few thoughts and come back!")
             st.stop()
 
-        # ---- Build time window & previous window ----
-        now = pd.Timestamp.now()
-        end = now.normalize()
-        start = (end - pd.Timedelta(days=window_days - 1)).normalize()
+        # ---- Weekly window (last 7 days, inclusive of today) ----
+        today = pd.Timestamp.now().normalize()               # e.g., 2025-09-04 00:00
+        start = (today - pd.Timedelta(days=6)).normalize()   # 7-day window start
+        end_excl = (today + pd.Timedelta(days=1)).normalize()# exclusive upper bound (tomorrow 00:00)
 
-        df_window = df_all[(df_all["ts"] >= start) & (df_all["ts"] <= end)].copy()
-        df_prev = df_all[
-            (df_all["ts"] >= (start - pd.Timedelta(days=window_days))) &
-            (df_all["ts"] < start)
-        ].copy()
+        df_window = df_all[(df_all["ts"] >= start) & (df_all["ts"] < end_excl)].copy()
+        df_prev   = df_all[(df_all["ts"] >= (start - pd.Timedelta(days=7))) &
+                        (df_all["ts"] < start)].copy()
 
-        # ---- Metrics for the chosen window ----
-        days_active = int(df_window["ts"].dt.date.nunique()) if not df_window.empty else 0
-        total_entries_window = int(len(df_window))
 
-        # overall streaks (meaningful to users)
-        s_overall = compute_streaks(df_all)
+        if df_window.empty:
+            st.info(f"No entries in the last 7 days ({start.date()} → {end_excl.date()}).")
+            st.stop()
 
-        avg_window = float(df_window["sentiment_score"].astype(float).mean()) if not df_window.empty else 0.0
-        avg_prev   = float(df_prev["sentiment_score"].astype(float).mean()) if not df_prev.empty else None
+        # All-time streak stats (use the full dataset)
+        s_all = compute_streaks(df_all)   # -> has .current, .best, .days_active_30
+        best_streak = int(getattr(s_all, "best", 0))
+        current_streak = int(getattr(s_all, "current", 0))
+        active_30 = int(getattr(s_all, "days_active_30", 0))
 
-        # daily aggregates inside the window
+        # --- helpers ---
+        def _hour_label(h: int) -> str:
+            if h == 0: return "12 AM"
+            if h < 12: return f"{h} AM"
+            if h == 12: return "12 PM"
+            return f"{h-12} PM"
+
+        def compound_to_pct(x: float) -> int:
+            try:
+                return int(round((float(x) + 1.0) * 50))  # [-1,1] -> [0,100]
+            except Exception:
+                return 50
+
+        def compound_to_band(x: float):
+            x = float(x)
+            if x <= -0.60:     return ("Very negative", "🙁")
+            if x <= -0.05:     return ("Negative", "😕")
+            if x <  0.05:      return ("Neutral", "😐")
+            if x <  0.60:      return ("Positive", "🙂")
+            return ("Very positive", "😊")
+
+        # ---- Weekly metrics (scoped to df_window) ----
+        days_active = int(df_window["ts"].dt.date.nunique())
+        total_entries_week = int(len(df_window))
+        avg_week = float(df_window["sentiment_score"].astype(float).mean())
+        avg_prev = float(df_prev["sentiment_score"].astype(float).mean()) if not df_prev.empty else None
+
+        # daily aggregates
         daily_counts = entries_by_day(df_window)       # Series[date] -> count
-        daily_avgs   = avg_sentiment_by_day(df_window) # Series[date] -> avg sentiment
+        daily_avgs   = avg_sentiment_by_day(df_window) # Series[date] -> avg compound
         daily = []
-        for d in pd.date_range(start=start, end=end, freq="D"):
+        for d in pd.date_range(start=start, end=end_excl, freq="D"):
             dk = d.normalize()
             c = int(daily_counts.get(dk, 0)) if hasattr(daily_counts, "get") else (int(daily_counts[dk]) if dk in daily_counts.index else 0)
             a = float(daily_avgs.get(dk, 0.0)) if hasattr(daily_avgs, "get") else (float(daily_avgs[dk]) if dk in daily_avgs.index else 0.0)
             daily.append({"date": dk.strftime("%Y-%m-%d"), "count": c, "avg": a})
 
-        # peaks within the window (best/tough day)
+        # peaks inside week
         best_day = tough_day = None
         if not daily_avgs.empty:
             try:
@@ -551,119 +559,138 @@ def render_app():
             except Exception:
                 pass
 
-        # journaling hour label (within the window)
-        def _hour_label(h: int) -> str:
-            if h == 0: return "12 AM"
-            if h < 12: return f"{h} AM"
-            if h == 12: return "12 PM"
-            return f"{h-12} PM"
-
+        # best journaling hour (within week)
         best_hour_label = None
-        if not df_window.empty:
-            from collections import Counter
-            df_window["_hour"] = df_window["ts"].dt.hour
-            cnt = Counter(df_window["_hour"].tolist())
-            if cnt:
-                best_hour = max(cnt.items(), key=lambda x: x[1])[0]
-                best_hour_label = _hour_label(int(best_hour))
+        df_window["_hour"] = df_window["ts"].dt.hour
+        cnt = Counter(df_window["_hour"].tolist())
+        if cnt:
+            best_hour = max(cnt.items(), key=lambda x: x[1])[0]
+            best_hour_label = _hour_label(int(best_hour))
 
-        # Top themes for the window (up to 6–8)
+        # top themes (within week)
         top_themes: list[str] = []
         try:
-            kwdf_window = top_keywords_overall(df_window, k=10)  # pull a few extra, cap below
+            kwdf_window = top_keywords_overall(df_window, k=10)
             if not kwdf_window.empty:
                 if "keyword" in kwdf_window.columns:
                     top_themes = kwdf_window["keyword"].astype(str).tolist()
                 else:
                     top_themes = kwdf_window.iloc[:, 0].astype(str).tolist()
+            top_themes = top_themes[:8]
         except Exception:
-            pass  # keep []
+            pass
 
-        # ---- Compact payload for longer ranges (speed + reliability) ----
-        def _sample_daily(daily_list: list[dict], max_points: int) -> list[dict]:
-            n = len(daily_list)
-            if n <= max_points:
-                return daily_list
-            # even sampling including first/last
-            idxs = sorted({int(round(i * (n - 1) / (max_points - 1))) for i in range(max_points)})
-            return [daily_list[i] for i in idxs]
+        # convert to 0–100 once
+        avg_pct  = compound_to_pct(avg_week)
+        prev_pct = compound_to_pct(avg_prev) if avg_prev is not None else None
 
-        def _cap(lst: list[str], k: int) -> list[str]:
-            return lst[:k] if lst else []
+        # daily: keep date & count, convert avg→mood_pct
+        daily_pct = [
+            {"date": d["date"], "count": int(d["count"]), "mood_pct": compound_to_pct(d["avg"])}
+            for d in daily
+        ]
 
-        max_points = 10 if period in ("Monthly", "Yearly") else 7
-        daily_compact = _sample_daily(daily, max_points)
-        top_themes = _cap(top_themes, 6 if period in ("Monthly", "Yearly") else 8)
-
-        # ---- LLM summary for selected period (cached per window) ----
-        period_label = period
-        week_ctx = {
-            "window": {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")},
-            "totals": {"entries": total_entries_window, "days_active": days_active},
-            "streak": {"current": int(s_overall.current), "best": int(s_overall.best)},
-            "avg_sent": {"week": avg_window, "prev_week": avg_prev},
-            "best_hour_label": best_hour_label,
-            "top_themes": top_themes,
-            "daily": daily_compact,
-            "peaks": {"best_day": best_day, "tough_day": tough_day},
+        # peaks: convert avg→mood_pct
+        peaks_pct = {
+            "best_day": ({"date": best_day["date"], "mood_pct": compound_to_pct(best_day["avg"])} if best_day else None),
+            "tough_day": ({"date": tough_day["date"], "mood_pct": compound_to_pct(tough_day["avg"])} if tough_day else None),
         }
 
-        cache_key = f"summary|{period}|{start.date()}|{end.date()}"
+        # build the context WITHOUT raw -1..1 values
+        week_ctx = {
+            "period": "weekly",
+            "window": {"start": start.strftime("%Y-%m-%d"), "end": end_excl.strftime("%Y-%m-%d")},
+            "totals": {"entries": total_entries_week, "days_active": days_active},
+            "avg_mood": {"period_pct": avg_pct, "prev_pct": prev_pct},
+            "best_hour_label": best_hour_label,
+            "top_themes": top_themes,
+            "daily_mood": daily_pct,    # <-- use this
+            "peaks_mood": peaks_pct,    # <-- and this
+        }
+
+
+        cache_key = f"summary|weekly|{start.date()}|{end_excl.date()}"
         weekly_md = st.session_state.get(cache_key)
-        if not weekly_md:
-            try:
-                weekly_md = generate_weekly_summary_llm(week_ctx)
-                st.session_state[cache_key] = weekly_md
-            except Exception as e:
-                weekly_md = f"_Summary unavailable (LLM error: {e})._"
 
-        with st.container(border=True):
-            st.markdown(f"### {period_label} summary")
-            st.markdown(weekly_md)
+        if weekly_md is None:
+            gen = st.button("Generate weekly summary", use_container_width=True)
+            if gen:
+                with st.spinner("Summarizing your week…"):
+                    try:
+                        weekly_md = generate_weekly_summary_llm(week_ctx)
+                        st.session_state[cache_key] = weekly_md
+                    except Exception as e:
+                        weekly_md = f"_Summary unavailable (LLM error: {e})._"
 
-        # refresh button BELOW the summary
-        if st.button("Refresh summary", use_container_width=True):
-            st.session_state.pop(cache_key, None)
-            st.rerun()
+        if weekly_md is not None:
+            with st.container(border=True):
+                st.markdown("### Weekly summary")
+                st.markdown(weekly_md)
+
+            if st.button("Refresh weekly summary", use_container_width=True, key=f"refresh_{cache_key}"):
+                with st.spinner("Refreshing summary…"):
+                    st.session_state.pop(cache_key, None)
+                    st.rerun()
+        else:
+            st.caption("Tip: Generate a weekly summary when you’re ready. It’s cached for this week.")
+
 
         st.divider()
 
-        # ---------- Analytics (scoped to selected period; keep some overall context) ----------
-        df = df_window
+        # ---------- Weekly analytics (ALL scoped to df_window) ----------
+        avg_pct = compound_to_pct(avg_week)
+        label, emoji = compound_to_band(avg_week)
 
-        s = compute_streaks(df_all)  # overall streak context
-        total_entries_all = int(len(df_all))
-        last_7 = df_all[df_all["ts"] >= (pd.Timestamp.now() - pd.Timedelta(days=7))]
-        avg7 = last_7["sentiment_score"].astype(float).mean() if not last_7.empty else 0.0
-
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("Total entries (all time)", f"{total_entries_all}")
+            st.metric("Total entries (weekly)", f"{total_entries_week}")
         with m2:
-            st.metric("Current streak", f"{s.current} days", help="Consecutive days ending today")
-            st.caption(f"Best: **{s.best}** · Active last 30d: **{s.days_active_30}**")
+            st.metric("Days active (weekly)", f"{days_active}")
         with m3:
-            mood_emoji = "🙂" if avg7 >= 0.1 else ("🙁" if avg7 <= -0.1 else "😐")
-            st.metric("Past 7d mood", f"{avg7:+.2f} {mood_emoji}", help="Average VADER compound score over last 7 days")
+            st.metric(
+                "Mood (weekly)",
+                f"{avg_pct} {emoji}",
+                help="VADER avg mapped to 0–100 (50 = neutral)"
+            )
+        with m4:
+            st.metric("Best streak (all time)", f"{best_streak} days", help="Longest daily writing streak")
+
+        st.caption(f"Current streak: **{current_streak}** days · Active last 30d: **{active_30}** days")
 
         st.divider()
 
-        st.markdown(f"#### Entries per day ({period_label.lower()})")
-        daily_overall = entries_by_day(df)
+        st.markdown("#### Entries per day (weekly)")
+        daily_overall = entries_by_day(df_window)
         st.line_chart(daily_overall, height=220)
 
-        st.markdown(f"#### Average sentiment by day ({period_label.lower()})")
-        daily_avg_overall = avg_sentiment_by_day(df)
-        st.line_chart(daily_avg_overall, height=220)
+        st.markdown("#### Average sentiment by day (weekly)")
+        daily_avg_overall = avg_sentiment_by_day(df_window).reset_index()
+        daily_avg_overall.columns = ["date", "compound"]
+        daily_avg_overall["mood_pct"] = daily_avg_overall["compound"].apply(compound_to_pct)
+
+        line = (
+            alt.Chart(daily_avg_overall)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("mood_pct:Q", title="Mood (0–100)", scale=alt.Scale(domain=[0, 100])),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("compound:Q", title="VADER", format="+.2f"),
+                    alt.Tooltip("mood_pct:Q", title="Mood (0–100)"),
+                ],
+            )
+            .properties(height=220)
+        )
+        neutral_rule = alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(strokeDash=[4, 4]).encode(y="y:Q")
+        st.altair_chart(line + neutral_rule, use_container_width=True)
 
         st.divider()
 
-        st.markdown(f"#### Best journaling hour ({period_label.lower()})")
-        # yearly might want more data; otherwise, use window
-        best_hour, by_hour = best_journaling_hour(df_all if period == "Yearly" else df)
-        if best_hour is not None:
-            st.caption(f"You tend to write most around **{_hour_label(best_hour)}**.")
-
+        st.markdown("#### Best journaling hour (weekly)")
+        bh, by_hour = best_journaling_hour(df_window)
+        if bh is not None:
+            st.caption(f"You tend to write most around **{_hour_label(bh)}**.")
         hour_df = pd.DataFrame({"hour": [int(h) for h in by_hour.index], "entries": by_hour.values})
         hour_df["label"] = hour_df["hour"].apply(_hour_label)
         hour_chart = (
@@ -682,20 +709,72 @@ def render_app():
 
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"#### Top themes ({period_label.lower()})")
-            kwdf = top_keywords_overall(df, k=12)
+            st.markdown("#### Top themes (weekly)")
+            kwdf = top_keywords_overall(df_window, k=12)
             if kwdf.empty:
                 st.info("Not enough keyword data yet.")
             else:
                 st.dataframe(kwdf, use_container_width=True, height=260)
 
         with c2:
-            st.markdown(f"#### Emotion mix ({period_label.lower()})")
-            emos = emotion_distribution(df)
+            st.markdown("#### Emotion mix (weekly)")
+
+            emos = emotion_distribution(df_window)
             if emos.empty:
                 st.info("No sentiment yet.")
             else:
-                st.bar_chart(emos, height=260)
+                # Normalize to a tidy df: label, count
+                if isinstance(emos, pd.Series):
+                    emos_df = emos.reset_index()
+                    emos_df.columns = ["label", "count"]
+                else:
+                    # expect columns like ["label","count"] or ["sentiment","count"]
+                    if "label" not in emos.columns:
+                        emos_df = emos.rename(columns={"sentiment": "label"})[["label", "count"]].copy()
+                    else:
+                        emos_df = emos[["label", "count"]].copy()
+
+                # Order + percent
+                order = ["positive", "neutral", "negative"]  # or ["negative","neutral","positive"]
+                total = int(emos_df["count"].sum())
+                if total == 0:
+                    st.info("No sentiment yet.")
+                else:
+                    emos_df["pct"] = (emos_df["count"] / total * 100).round(0)
+                    emos_df["label_txt"] = emos_df.apply(lambda r: f"{int(r['count'])}  ({int(r['pct'])}%)", axis=1)
+
+                    # Consistent, readable colors
+                    palette = {"negative": "#ef4444", "neutral": "#9ca3af", "positive": "#22c55e"}
+
+                    bars = (
+                        alt.Chart(emos_df)
+                        .mark_bar()
+                        .encode(
+                            y=alt.Y("label:N", sort=order, title=None),
+                            x=alt.X("count:Q", title="Entries", scale=alt.Scale(domainMin=0, nice=True)),
+                            color=alt.Color("label:N",
+                                            scale=alt.Scale(domain=list(palette.keys()), range=list(palette.values())),
+                                            legend=None),
+                            tooltip=[
+                                alt.Tooltip("label:N", title="Sentiment"),
+                                alt.Tooltip("count:Q", title="Entries"),
+                                alt.Tooltip("pct:Q", title="Share (%)"),
+                            ],
+                        )
+                        .properties(height=220)
+                    )
+
+                    labels = (
+                        bars.mark_text(
+                            align="left",
+                            baseline="middle",
+                            dx=6,
+                        )
+                        .encode(text="label_txt:N")
+                    )
+
+                    st.altair_chart(bars + labels, use_container_width=True)
+
 
         st.divider()
 
@@ -713,17 +792,119 @@ def render_app():
             use_container_width=True,
         )
 
-
-
-    # ============ History ============
+    # ============ History (Calendar view) ============
     with tab_history:
-        st.subheader("Your entries")
+        st.subheader("Browse your history by calendar")
+
         df = load_entries_df(user_id)
         if df.empty:
             st.info("No entries yet.")
+            st.stop()
+
+        # Helpers
+        def _compound_to_pct(x: float) -> int:
+            try:
+                return int(round((float(x) + 1.0) * 50))  # [-1,1] -> [0,100]
+            except Exception:
+                return 50
+
+        def _sentiment_badge(score: float) -> str:
+            pct = _compound_to_pct(score)
+            if score <= -0.60:  label, color = "very negative", "#ef4444"
+            elif score <= -0.05: label, color = "negative", "#f97316"
+            elif score < 0.05:   label, color = "neutral", "#9ca3af"
+            elif score < 0.60:   label, color = "positive", "#22c55e"
+            else:                label, color = "very positive", "#16a34a"
+            return f"<span style='background:{color}22;border:1px solid {color};color:{color};padding:2px 8px;border-radius:12px;font-size:12px;'>{label} · {pct}</span>"
+
+        def _chip(word: str) -> str:
+            return f"<span style='display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;border-radius:12px;border:1px solid #3b3b3b;background:#262626;font-size:12px;'>{word}</span>"
+
+        def _set_hist_date(d):
+            st.session_state.history_date = d
+
+        # Prepare dates
+        df = df.copy()
+        df["date"] = df["ts"].dt.date
+        df["time"] = df["ts"].dt.strftime("%I:%M %p")
+        min_d = df["date"].min()
+        max_d = df["date"].max()
+
+        # Calendar picker (defaults to most recent date you wrote)
+        default_date = st.session_state.get("history_date", max_d)
+        sel_date = st.date_input(
+            "Pick a day",
+            value=default_date,
+            min_value=min_d,
+            max_value=max_d,
+            key="history_date",
+        )
+
+        # Prev / Next day shortcuts (safe against edges)
+        unique_days = sorted(df["date"].unique())
+
+        # If the selected date isn't in the list (e.g., changed via calendar),
+        # snap to the nearest valid writing day (latest).
+        if sel_date not in unique_days:
+            if unique_days:
+                sel_date = unique_days[-1]
+                st.session_state.history_date = sel_date
+            else:
+                unique_days = []  # no writing days at all (shouldn't happen since df not empty)
+
+        idx = unique_days.index(sel_date) if unique_days else 0
+
+        prev_target = unique_days[idx - 1] if idx > 0 else None
+        next_target = unique_days[idx + 1] if unique_days and idx < len(unique_days) - 1 else None
+
+        cprev, cspace, cnext = st.columns([1, 6, 1])
+        with cprev:
+            if prev_target is not None:
+                st.button("◀ Prev", on_click=_set_hist_date, args=(prev_target,), use_container_width=True)
+            else:
+                st.button("◀ Prev", disabled=True, use_container_width=True)
+
+        with cnext:
+            if next_target is not None:
+                st.button("Next ▶", on_click=_set_hist_date, args=(next_target,), use_container_width=True)
+            else:
+                st.button("Next ▶", disabled=True, use_container_width=True)
+
+
+        st.divider()
+
+        # Entries for the selected day
+        day_df = df[df["date"] == sel_date].sort_values("ts")
+        if day_df.empty:
+            st.info("No entries for this day.")
         else:
-            st.dataframe(
-                df[["ts", "sentiment_label", "sentiment_score", "top_keywords", "text"]],
-                use_container_width=True,
-                height=420,
-            )
+            st.markdown(f"### {sel_date.strftime('%A, %b %d, %Y')}")
+            for _, row in day_df.iterrows():
+                text = row["text"]
+                # If you stored "[timestamp] actual text", strip the bracketed prefix for display
+                if isinstance(text, str) and text.startswith("[") and "]" in text[:30]:
+                    text = text.split("]", 1)[-1].strip()
+
+                with st.container(border=True):
+                    top = st.columns([1, 3, 2])
+                    with top[0]:
+                        st.caption(row["time"])
+                    with top[1]:
+                        st.markdown(_sentiment_badge(float(row["sentiment_score"])), unsafe_allow_html=True)
+                    with top[2]:
+                        # keywords
+                        kws = row["top_keywords"] if isinstance(row["top_keywords"], list) else []
+                        if not kws and isinstance(row["top_keywords"], str):
+                            try:
+                                import json as _json
+                                tmp = _json.loads(row["top_keywords"])
+                                if isinstance(tmp, list):
+                                    kws = tmp
+                            except Exception:
+                                pass
+                        if kws:
+                            st.markdown("".join(_chip(w) for w in kws[:10]), unsafe_allow_html=True)
+
+                    st.markdown(text)
+
+        st.caption("Tip: use the calendar to jump to any day you wrote. Prev/Next quickly hops between writing days.")

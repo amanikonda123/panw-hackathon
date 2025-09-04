@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import List, Dict, Tuple
-
+from typing import List
+import json
 import pandas as pd
 
 
@@ -55,68 +55,60 @@ def compute_streaks(df: pd.DataFrame) -> Streaks:
 
     return Streaks(current=curstreak, best=best, days_active_30=days_active_30)
 
-
 def entries_by_day(df: pd.DataFrame) -> pd.Series:
+    """Count of entries per calendar day."""
     if df.empty:
         return pd.Series(dtype=int)
-    d = df.copy()
-    d["date"] = pd.to_datetime(d["ts"]).dt.date
-    return d.groupby("date").size().rename("entries")
-
+    s = df.copy()
+    s["date"] = s["ts"].dt.normalize()
+    return s.groupby("date").size()
 
 def avg_sentiment_by_day(df: pd.DataFrame) -> pd.Series:
+    """
+    TRUE daily average of VADER compound scores (continuous in [-1, 1]).
+    No rounding, no sign mapping.
+    """
     if df.empty:
         return pd.Series(dtype=float)
-    d = df.copy()
-    d["date"] = pd.to_datetime(d["ts"]).dt.date
-    # map labels to -1/0/1 for a simple, readable line
-    label_map = {"negative": -1, "neutral": 0, "positive": 1}
-    d["sent_val"] = d["sentiment_label"].map(label_map).fillna(0)
-    return d.groupby("date")["sent_val"].mean().rename("avg_sentiment")
+    s = df.copy()
+    s["date"] = s["ts"].dt.normalize()
+    # ensure numeric and drop NaNs
+    s["sentiment_score"] = pd.to_numeric(s["sentiment_score"], errors="coerce")
+    s = s.dropna(subset=["sentiment_score"])
+    return s.groupby("date")["sentiment_score"].mean()
 
-
-def best_journaling_hour(df: pd.DataFrame) -> Tuple[int | None, pd.Series]:
-    """
-    Returns (best_hour, counts_by_hour Series). best_hour is 0-23 or None.
-    """
+def best_journaling_hour(df: pd.DataFrame):
+    """Unchanged: returns (best_hour_int, counts_series) scoped to df."""
     if df.empty:
         return None, pd.Series(dtype=int)
-    d = df.copy()
-    d["hour"] = pd.to_datetime(d["ts"]).dt.hour
-    counts = d.groupby("hour").size().reindex(range(24), fill_value=0)
-    best = int(counts.idxmax()) if counts.sum() > 0 else None
-    return best, counts.rename("entries")
-
+    s = df.copy()
+    s["_hour"] = s["ts"].dt.hour
+    counts = s.groupby("_hour").size().sort_values(ascending=False)
+    best = int(counts.index[0]) if not counts.empty else None
+    return best, counts
 
 def top_keywords_overall(df: pd.DataFrame, k: int = 12) -> pd.DataFrame:
-    """
-    Flattens top_keywords lists and returns a DataFrame with columns [term, count],
-    sorted by count desc.
-    """
+    """Unchanged: returns keywords & counts from df['top_keywords'] lists."""
     if df.empty or "top_keywords" not in df.columns:
-        return pd.DataFrame(columns=["term", "count"])
-    all_terms: List[str] = []
+        return pd.DataFrame(columns=["keyword", "count"])
+    bag = []
     for row in df["top_keywords"].tolist():
         if isinstance(row, list):
-            all_terms.extend([str(t).lower() for t in row if t])
-        elif isinstance(row, str):
-            # if stored as JSON string by mistake, be robust
+            bag.extend([str(x).strip() for x in row if x])
+        elif isinstance(row, str) and row:
             try:
-                import json
                 lst = json.loads(row)
                 if isinstance(lst, list):
-                    all_terms.extend([str(t).lower() for t in lst if t])
+                    bag.extend([str(x).strip() for x in lst if x])
             except Exception:
                 pass
-    counter = Counter(all_terms)
-    common = counter.most_common(k)
-    return pd.DataFrame(common, columns=["term", "count"])
+    c = Counter([w for w in bag if w])
+    items = c.most_common(k)
+    return pd.DataFrame(items, columns=["keyword", "count"])
 
-
-def emotion_distribution(df: pd.DataFrame) -> pd.Series:
-    if df.empty:
-        return pd.Series(dtype=int)
-    d = df.copy()
-    d["sentiment_label"] = d["sentiment_label"].fillna("neutral")
-    counts = d["sentiment_label"].value_counts().reindex(["positive", "neutral", "negative"], fill_value=0)
-    return counts.rename("entries")
+def emotion_distribution(df: pd.DataFrame) -> pd.DataFrame:
+    """Unchanged: counts by sentiment_label in df (pos/neu/neg)."""
+    if df.empty or "sentiment_label" not in df.columns:
+        return pd.DataFrame({"label": [], "count": []})
+    counts = df["sentiment_label"].value_counts()
+    return pd.DataFrame({"label": counts.index, "count": counts.values})
