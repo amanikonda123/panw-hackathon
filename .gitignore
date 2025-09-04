@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.venv/
+.env
+.venv*/
+env/
+venv/
+
+# Streamlit / cache
+.streamlit/
+**/.DS_Store
+**/.idea/
+**/.vscode/
+
+# SQLite DB
+data/journal.db
+
+# OAuth tokens
+tokens/*.json
+credentials/*.json
+
+# Jupyter / misc
+*.ipynb_checkpoints

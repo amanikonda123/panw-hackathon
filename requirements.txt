@@ -1,0 +1,14 @@
+streamlit==1.40.0
+pandas==2.2.2
+requests==2.32.3
+
+# Google OAuth + APIs
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.141.0
+
+scikit-learn==1.5.1
+nltk==3.9.1
+yake>=0.4.8
+vaderSentiment==3.3.2
+
